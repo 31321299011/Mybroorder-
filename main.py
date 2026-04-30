@@ -1,6 +1,8 @@
 import os
 import logging
 import requests
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -8,6 +10,17 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = "8365752689:AAGlvlW03sNQHPVK-Ewm8DHOslz4Hhm1t3Q"
+
+# Flask app to keep alive
+keep_alive = Flask(__name__)
+
+@keep_alive.route('/')
+def home():
+    return "Bot is Running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    keep_alive.run(host="0.0.0.0", port=port)
 
 # Conversation states
 ASK_APIKEY, ASK_CHANNEL, ASK_AMOUNT = range(3)
@@ -18,9 +31,6 @@ used_posts = set()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 
 # ─── /start ───────────────────────────────────────────────
@@ -34,22 +44,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_apikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     apikey = update.message.text.strip()
-
-    if user_id not in user_configs:
-        user_configs[user_id] = {}
-    user_configs[user_id]["apikey"] = apikey
-
-    await update.message.reply_text("✅ API Key সেভ হয়েছে!\n\nএখন আপনার *চ্যানেল লিংক* দিন:", parse_mode="Markdown")
+    user_configs[user_id] = {"apikey": apikey}
+    await update.message.reply_text("✅ API Key সেভ!\n\n*চ্যানেল লিংক* দিন:", parse_mode="Markdown")
     return ASK_CHANNEL
 
 
-# ─── Channel লিংক সেভ ────────────────────────────────────
+# ─── Channel সেভ ──────────────────────────────────────────
 async def save_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     channel = update.message.text.strip()
     user_configs[user_id]["channel"] = channel
-
-    await update.message.reply_text("✅ চ্যানেল লিংক সেভ হয়েছে!\n\nএখন *Amount* দিন:", parse_mode="Markdown")
+    await update.message.reply_text("✅ চ্যানেল সেভ!\n\n*Amount* দিন:", parse_mode="Markdown")
     return ASK_AMOUNT
 
 
@@ -59,20 +64,19 @@ async def save_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount = update.message.text.strip()
 
     if not amount.isdigit():
-        await update.message.reply_text("❌ Amount অবশ্যই সংখ্যা হতে হবে। আবার দিন:")
+        await update.message.reply_text("❌ সংখ্যা দিন!")
         return ASK_AMOUNT
 
     user_configs[user_id]["amount"] = amount
     cfg = user_configs[user_id]
 
     await update.message.reply_text(
-        f"🎉 *সেটআপ সম্পন্ন হয়েছে!*\n\n"
-        f"🔑 API Key: `{cfg['apikey']}`\n"
+        f"🎉 *সেটআপ সম্পন্ন!*\n"
+        f"🔑 API: `{cfg['apikey']}`\n"
         f"📢 চ্যানেল: {cfg['channel']}\n"
         f"📊 Amount: {cfg['amount']}\n\n"
-        f"⚠️ এখন বটকে চ্যানেলের *Admin* করুন।\n"
-        f"তারপর চ্যানেলে পোস্ট করলেই API কল যাবে! ✅\n\n"
-        f"🔄 সেটআপ পরিবর্তন করতে আবার /start দিন।",
+        f"⚠️ বটকে চ্যানেলে Admin বানান!\n"
+        f"🔄 /start দিয়ে পরিবর্তন করুন।",
         parse_mode="Markdown"
     )
     return ConversationHandler.END
@@ -81,7 +85,7 @@ async def save_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Cancel ───────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ সেটআপ বাতিল করা হয়েছে। /start দিয়ে আবার শুরু করুন।")
+    await update.message.reply_text("❌ বাতিল। /start দিন")
     return ConversationHandler.END
 
 
@@ -93,31 +97,29 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         chat = message.chat
-        message_id = message.message_id
-
         if not chat.username:
             return
 
-        post_link = f"https://t.me/{chat.username}/{message_id}"
-        channel_link = f"https://t.me/{chat.username}"
+        post_link = f"https://t.me/{chat.username}/{message.message_id}"
 
         if post_link in used_posts:
             return
         used_posts.add(post_link)
 
-        # যেকোনো config ব্যবহার
+        # Match channel
         matched_config = None
-        for uid, cfg in user_configs.items():
-            if channel_link in cfg.get("channel", "").rstrip("/"):
+        for cfg in user_configs.values():
+            if chat.username in cfg.get("channel", ""):
                 matched_config = cfg
                 break
 
         if not matched_config and user_configs:
             matched_config = list(user_configs.values())[-1]
-        elif not matched_config:
+
+        if not matched_config:
             return
 
-        apikey = matched_config.get("apikey", "")
+        apikey = matched_config["apikey"]
         amount = matched_config.get("amount", "20")
 
         api_url = (
@@ -130,8 +132,8 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         response = requests.get(api_url, timeout=10)
-        logger.info(f"Post: {post_link}")
-        logger.info(f"API Response: {response.text}")
+        logger.info(f"✅ Post: {post_link}")
+        logger.info(f"✅ Response: {response.text}")
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -139,6 +141,10 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────
 def main():
+    # Flask সার্ভার থ্রেডে চালু
+    Thread(target=run_flask, daemon=True).start()
+
+    # Bot start
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -155,18 +161,8 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_post))
 
-    # Webhook mode for Render Free (prevents timeout)
-    if WEBHOOK_URL:
-        logger.info("Starting Webhook mode...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{WEBHOOK_URL}/webhook",
-            path="webhook"
-        )
-    else:
-        logger.info("Starting Polling mode...")
-        app.run_polling()
+    logger.info("🤖 Bot Started!")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
